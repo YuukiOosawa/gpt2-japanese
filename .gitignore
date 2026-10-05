@@ -1,2 +1,3 @@
 *.pt
 *.safetensors
+.log
