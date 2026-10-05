@@ -1,3 +1,7 @@
 *.pt
 *.safetensors
 .log
+models/
+finetuned_model_1/
+eval_results/
+__pycache__/
