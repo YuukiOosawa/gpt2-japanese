@@ -1,0 +1,62 @@
+# ==========================================
+# GPT-2 日本語モデル ファインチューニング設定
+# ==========================================
+
+# システム設定
+system:
+  device: "auto"                      # 使用デバイス ('auto', 'cuda', 'cuda:0', 'cpu')
+  seed: 2025                            # 乱数シード (再現性用、nullで指定なし)
+
+# モデル設定
+model:
+  name: "rinna/japanese-gpt2-medium"  # 使用するモデル名 (候補: 'rinna/japanese-gpt-1b')
+  do_lower_case: true                 # トークナイザーの小文字化設定
+
+# データセット設定
+data:
+  train_path: "amazon_review/amazon_review_train2.csv"
+  valid_path: "amazon_review/amazon_review_valid2.csv"
+  test_path: "amazon_review/amazon_review_test.csv"
+  src_column: "j_lists"               # 入力文のカラム名 (train, valid)
+  src_test_column: "j_lists_test"     # 入力文のカラム名 (test)
+  tgt_column: "sentence"              # 正解文のカラム名
+  add_bos_token: true                 # 文頭に<s>トークンを追加するかどうか
+  shortcut: false                     # データを一部に絞って実行するかどうか
+  shortcut_sizes:
+    train: 15000                      # shortcut有効時の学習データ数
+    valid: 3700                       # shortcut有効時の検証データ数
+    test: 560                         # shortcut有効時のテストデータ数
+
+# 学習ハイパーパラメータ
+training:
+  epochs: 20                          # エポック数 (例: 3, 5, 23)
+  batch_size: 16                      # バッチサイズ
+  accumulation_steps: 1               # 勾配累積ステップ数 (有効バッチサイズ = batch_size * accumulation_steps)
+  learning_rate: 0.00005              # 学習率 (5e-5)
+  weight_decay: 0.01                  # Weight Decay
+  teacher_forcing_ratio: 0.5          # Teacher Forcingの適用割合
+
+# DEBLEU (Differentiable Expected BLEU) 損失設定
+bleu:
+  enabled: true                       # DEBLEU損失を有効にするか (falseの場合はCE損失のみ)
+  max_ngram: 4                        # 最大n-gram次数 (N)
+  weights: [0.1, 0.3, 0.3, 0.3]       # 各n-gramの重み (w1, w2, w3, w4)
+  target_only: true                   # [SEP]以降の生成文のみを対象にBLEUを計算するか
+  # エポックに応じたalpha（DEBLEU損失の重み）スケジュール
+  # 各エポック開始時に、該当エポック以下の最大キーのalphaが適用されます
+  # 例: 0: 0.0 (エポック0〜3は0.0), 4: 0.001 (エポック4は0.001), 5: 0.002 (エポック5以降は0.002)
+  alpha_schedule:
+    0: 0.0
+    10: 0.001
+    15: 0.002
+
+# 出力・モデル保存先設定
+output:
+  save_dir: "models"                  # モデル保存先親ディレクトリ
+  save_prefix: "finetuned_model_epoch" # 保存ディレクトリの接頭辞 (例: finetuned_model_epoch_1)
+  save_intermediate_checkpoints: true # 指定したエポック毎にモデルを保存するか (True: 指定間隔 + 最終エポック, False: 最終エポックのみ)
+  save_epoch_interval: 1              # モデルを保存するエポックの間隔 (例: 5なら5, 10, ...エポック毎)
+
+# 推論プレビュー設定 (非Teacher Forcingの動作確認用)
+inference:
+  max_new_tokens: 50                  # 生成時の最大新規トークン数

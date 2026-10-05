@@ -1,203 +1,154 @@
-# gpt2-japanese
-Japanese GPT2 Generation Model
+# BLEU損失関数（DEBLEU）を使用したGPT-2の学習
 
-このプロジェクトは、[スポンサーを募集しています](report/sponsor.md)。[camp-fireの活動報告](https://camp-fire.jp/projects/320938/activities#menu)。[支援者一覧](special_thanks.txt)。
+## 実行方法
 
-* かねてより、camp-fireの募集期間が終了した後でも、支援出来ないかというお問い合わせを頂いていましたが、[GitHub Sponsors](https://github.com/sponsors/tanreinama)でのスポンサーを募集することにしました。リターンも、camp-fireの時と変わりません（さらに、camp-fireでは規約上不可能だったコーパスの提供も含めています）。
+モデル学習スクリプトは `train.py` です。基本設定は `config.yml` から読み込まれますが、ターミナル上のコマンドライン引数でパラメータを上書きして実行できます。
 
-# GPT2日本語モデル
+SSH接続を切断（ログアウト）した後も学習を継続させるため、**`nohup`** と **`&`** を使ったバックグラウンド実行を推奨します。  
+（※ `-u` オプションを付けることでログがバッファリングされず、`output.log` にリアルタイムで書き込まれます。）
 
-***<font color='red'>New</font>***
+---
 
-- [デモンストレーションサイトを作成しました](http://ailab.nama.ne.jp/#gpt2ja)
-- [GitHub Sponserによるスポンサーシップを開始しました](https://github.com/sponsors/tanreinama)
-- [ファインチューニング用のコードを公開しました](run_finetune.py)
-- [Largeモデルを公開しました](report/models.md)
+### モデル保存の状態別 実行コマンド（nohup によるバックグラウンド実行）
 
-  
+#### 0. 仮想環境の有効化
+必要なパッケージは次の通りです。
+train時： `tqdm`, `numpy`, `pandas`, `matplotlib`, `pyyaml`, `torch`
+評価時： `tqdm`, `numpy`, `pandas`, `torch`, `nltk`, `bert-score`
 
-## GPT2に日本語コーパスを学習させたものです
-
-### 学習済みモデルについて
-
-[report/models.md](report/models.md)
-
-### 学習させたコーパスについて
-
-[report/corpus.md](report/corpus.md)
-
-### スポンサーシップについて
-
-[report/sponsor.md](report/sponsor.md)
-
-### デモンストレーション
-
-[Sakamoto's AI lab](http://ailab.nama.ne.jp/#gpt2ja)
-
-### 関連プロジェクト
-
-[text2text-japanese](https://github.com/tanreinama/text2text-japanese)
-
-### TODO
-
-✓大規模コーパスの作成（2020/8/20）<br>✓日本語版BPEEncoder作成（2020/9/15）<br>
-✓mediumモデルの公開（2020/11/07）<br>✓smallモデルの公開（2020/12/24）<br>✓largeモデルの公開（2021/3/13）<br>
-
-## 使い方
-
-
-
-GitHubからコードをクローンします
-
-```sh
-$ git clone https://github.com/tanreinama/gpt2-japanese
-$ cd gpt2-japanese
+```bash
+conda activate myenv
 ```
 
-モデルファイルをダウンロードして展開します
+---
 
-```sh
-$ wget https://www.nama.ne.jp/models/gpt2ja-medium.tar.bz2
-$ tar xvfj gpt2ja-medium.tar.bz2
+#### 1. 指定したエポック毎にモデルを保存する場合（中間チェックポイント保存）
+`--save_intermediate_checkpoints true` を指定します。`--save_epoch_interval` で保存間隔（エポック数）を指定できます。  
+※ 指定間隔のエポックに加えて、**最終エポックも自動的に保存**されます。
+
+- **毎エポック保存する場合 (例: config.yml の設定通り、または明示指定)**
+  ```bash
+  nohup python3 -u train.py --save_intermediate_checkpoints true --save_epoch_interval 1 > output.log 2>&1 &
+  ```
+
+- **5エポック毎に保存する場合**
+  ```bash
+  nohup python -u train.py --save_intermediate_checkpoints true --save_epoch_interval 5 > output.log 2>&1 &
+  ```
+
+- **エポック数もターミナルから指定する場合 (例: 全20エポック、毎エポック保存)**
+  ```bash
+  nohup python -u train.py --epochs 20 --save_intermediate_checkpoints true --save_epoch_interval 1 > output.log 2>&1 &
+  ```
+
+保存先フォルダ: `models/finetuned_model_epoch_{epoch}/`
+
+---
+
+#### 2. 最終エポックのみモデルを保存する場合
+途中エポックの保存を行わず、全エポック完了時の最終モデルのみを保存します。
+
+```bash
+nohup python -u train.py --save_intermediate_checkpoints false > output.log 2>&1 &
 ```
 
-モデルを指定して実行します。Tensorflow 1.x/2.x両方で動作します
+- **エポック数を指定して最終モデルのみ保存する場合**
+  ```bash
+  nohup python -u train.py --epochs 20 --save_intermediate_checkpoints false > output.log 2>&1 &
+  ```
 
-```sh
-$ python3 gpt2-generate.py --model gpt2ja-medium --num_generate 1
+保存先フォルダ: `models/finetuned_model_epoch_{最終エポック}/`
+
+---
+
+#### 3. 設定ファイル（config.yml）の内容でそのままバックグラウンド実行する場合
+引数を省略すると `config.yml` の値がすべて適用されます。
+
+```bash
+nohup python -u train.py > output.log 2>&1 &
 ```
 
-### サンプル
-
-```sh
-$ python3 gpt2-generate.py
-2017年、東京と大阪が初めて合併したことをきっかけに日本文化を深く理解するとともに豊かさを体感出来る場を作りたい。2017年の日本は“豊か”な時代になっているのか。そして、どの時間帯にどこへ行こうか、今自分が何をしているかが大切であると考えるようになった。今回のセミナーでは、私たち自身が今こうして今の時代を生きていることの大きな魅力とは何かを、多くの皆様と共にさらに深く知っていただきたいと思っています。 ●会場               東京都港区新橋
-
-（・・・略）
+別ファイルを指定して実行する場合:
+```bash
+nohup python -u train.py --config config_custom.yml > output.log 2>&1 &
 ```
 
-- 以前のWikipediaのみ学習させたモデルよりも、自然な文章が生成されるようになりました
-- ブログ記事、ニュースリリース、百科事典サイトなどの要素を含んだ汎用的な文章生成が出来ます
+---
 
-```sh
-$ python3 gpt2-generate.py --context="『GPT-2』は、入力された文章の続きを作成するAIです。このデモンストレーションでは、このエリアに入力された文章の続きとなる文章を生成します。このエリアに、続きを生成したい文章を入力して、ページの下にある「Generate Japanese Text\!」ボタンをクリックしてください。"
-これで、ページの下にある「Generate Japanese Text\!」ボタンが押されたら、完了です。
-このように画面内に作りたい文章やその作り方が表示されます。ボタンの部分をクリックして、キーボード上のボタンを押してページを閉じると、そのページを作り始めることができます。作ったものを保存し、ページを閉じようとしています。
+### 学習の進捗確認とプロセスの管理
 
-1つ目の画面
-AIではこのような画面が作れます。
+#### ログのリアルタイム確認
+SSH再接続後など、学習の進捗ログを確認するには以下のコマンドを実行します。
+```bash
+tail -f output.log
+```
+※ `Ctrl + C` を押すとログ表示を終了できます（学習プロセス自体はバックグラウンドで継続して動作します）。
 
-2つ目の画面
-ボタン上の「Generate Japanese Text\!」をクリックしてページの下にある「Generate Japanese Text\!」を押すと、次のような画面が出てきます。
+#### 実行中プロセスの確認
+```bash
+ps aux | grep train.py
+```
+（または `nvidia-smi` でGPU使用状況を確認）
 
-今回はページの下にある「Generate Japanese Text\!」を押してページを作り始めます。
-ボタンの部分をクリックすると、この画面が出ます。この画面を見てみると、次のような文章が沢山表示されています。
-
-これを読んで「これが作りたい文章を言ってほしい文章だな」と思ったら、ページのページを閉じてください。
-
- （・・・略）
+#### 学習プロセスの停止（強制終了）
+```bash
+kill <PID>
+# 停止しない場合は強制終了: kill -9 <PID>
 ```
 
-- contextを指定すると、それに続く文章が出てきます
+---
 
-- 長めのcontextを指定する方が、続く文章も自然な文章になる傾向があるようです
+## モデルの評価（Evaluation）
 
+学習済みモデルに対してテストデータを入力し、文生成および評価指標（BLEU-1〜4、BERTScore）の算出を行います。  
+※ 評価の実行には `nltk` および `bert_score` が必要です（インストールされている環境、例: `base` 環境等で実行してください）。
 
-```sh
-$ python3 gpt2-generate.py --context="俺の名前は坂本俊之。何処にでもいるサラリーマンだ。"
-そして、その坂本と同時に、目の前に現れた人物に驚き固まる。
-「なんでここに！
-……なんでこんな……」
-俺は目の前に現れた人を見ようと顔を上げたが、その人は俺の驚きを無視できないように、少し顔を近づけて俺を観察していた。
-「……って、もしかして、お前、俺と同じ学年だな？」
-俺の表情を読み取ったのか、坂本がそう言い、目の前の人物に問いかけた。その姿を見れば、なんとなく察してしまった。
-「おいおい、驚いたなぁ〜。本当に、君のお兄さんは？」
-その人物の方も驚いた様子で、目の前の人物の顔を凝視し始める。
-「はぁ、あんた誰？いきなり現れて驚いたんだよ。まぁ、こんな人を見なかったことにしとくよ。俺はただのクラスの人で、こんなんがクラスに居たら目立つからね」
-この人が坂本先輩。俺がここに来た時、突然現れた謎の人物である先輩。
-「おっ、お兄さん、本当に、やっぱり僕のクラスの人っすね。こんな偶然ってありますかねぇ？」
-「おいおい、あんたはクラスの人からそんなこと言われてもねぇ。クラスまで俺のクラスだと思うなんて酷いじゃないか。まぁ、これでも一応高校生だったんだけどさ〜」
-「そ、そういう意味じゃ無かったんで
+### 1. フォルダ内の全モデルを一括評価 (`evaluate_all.py`)
 
-（・・・略）
+指定した親フォルダ（例: `models/`）内にある全モデルディレクトリ（`finetuned_model_epoch_1`, `epoch_2`, ...）を自動探索し、エポック番号順にソートして順次 `eval.py` を実行します。  
+生成文CSVや評価スコアJSON、および全モデルの比較サマリー表を指定フォルダに自動格納します。
+
+#### 基本実行コマンド（フォアグラウンド）
+```bash
+python evaluate_all.py --models_dir models --output_dir eval_results
 ```
 
-- ウェブ小説っぽい文章も生成出来ます。
+#### バックグラウンド実行（nohup による実行推奨）
+全モデルの評価は時間を要するため、SSH接続切断後も継続実行できるようバックグラウンド実行を推奨します。
 
-  
-
-```sh
-$ python3 gpt2-generate.py --min_length 512 --max_length 1024
+```bash
+nohup python -u evaluate_all.py --models_dir models --output_dir eval_results > eval.log 2>&1 &
 ```
 
-- 「min_length」と「max_length」で生成する文章の長さを指定出来ます。「min_length」は1024までです。
+- **ログの確認:**
+  ```bash
+  tail -f eval.log
+  ```
+- **実行中プロセスの確認:**
+  ```bash
+  ps aux | grep evaluate_all.py
+  ```
 
-  
+---
 
-### 文章ベクトル生成
+### 2. 単一モデルの評価 (`eval.py`)
 
-```sh
-$ python3 gpt2-transform.py --model gpt2ja-medium --context="江戸時代のインターネット回線"
-[0.9214873313903809, 0.015924066305160522, 1.3564162254333496, 5.106584548950195, 2.991609573364258, 4.2116875648498535, 2.169468641281128, -55.102230072021484, -0.41729745268821716,
+特定のモデル単体を評価する場合は、`eval.py` に引数を渡して直接実行できます。
 
- （・・・略）
+```bash
+python eval.py --model_dir models/finetuned_model_epoch_20 --output_dir eval_results
 ```
 
-- 文章のベクトル化を行います
+---
 
-### 文章の採点
+### 3. Bash ループによる一括実行（シェルコマンドの場合）
 
-```sh
-$ printf "現在も行方不明のまま。\n現在も行方不明のママ。" | python3 gpt2-score.py --exclude-end -
-現在も行方不明のまま。	-25.579
-現在も行方不明のママ。	-33.87
+スクリプトを使わず、Bashのコマンドループで直接順次実行する場合は以下を実行します：
+
+```bash
+mkdir -p eval_results
+for model_dir in $(ls -d models/*/ | sort -V); do
+    echo "Evaluating ${model_dir}..."
+    python eval.py --model_dir "${model_dir}" --output_dir eval_results
+done
 ```
-
-- 言語モデルにより文章の確率の対数が表示されます。
-
-```sh
-$ echo 完全の域に達することは難い。 | python3 gpt2-score.py --tokens --exclude-end -
-完全の域に達することは難い。	-44.858
-完全	-8.5745
-の	-6.352
-域	-9.6646
-に	-1.1741
-達	-0.6282
-する	-1.3645
-こと	-3.2514
-は	-2.0751
-難	-2.9429
-い	-8.4598
-。	-0.37045
-```
-
-- `--tokens`を指定すると、それぞれのトークンの確率の対数が表示されます。
-
-
-
-## ファインチューニング
-
-[コーパス2020](https://github.com/tanreinama/gpt2-japanese/blob/master/report/corpus.md)でプレトレーニングしたモデルは公開しています。ここでの手順は、独自のデータでモデルをさらにファインチューニングする方法です。
-
-### エンコード
-
-[Japanese-BPEEncoder](https://github.com/tanreinama/Japanese-BPEEncoder)を使用して、学習させたい独自のデータをエンコードします。
-
-```sh
-$ git clone https://github.com/tanreinama/Japanese-BPEEncoder.git
-$ cd Japanese-BPEEncoder
-$ python encode_bpe.py --src_dir <content file path> --dst_file finetune
-$ mv finetune.npz ../
-$ cd ..
-```
-
-### 学習
-
-「--base_model」に元のプレトレーニング済みモデルを「--dataset 」にエンコードしたファイルを指定して、「run_finetune.py」を起動します。
-
-```sh
-$ python run_finetune.py --base_model gpt2ja-medium --dataset finetune.npz --run_name gpr2ja-finetune_run1
-```
-
-学習したモデルは、「checkpoint」以下の「--run_name」で指定したディレクトリ内に保存されます。
-
