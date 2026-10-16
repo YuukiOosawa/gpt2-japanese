@@ -24,6 +24,8 @@ def is_model_directory(path):
         "pytorch_model.bin",
         "generation_config.json",
         "tokenizer_config.json",
+        "adapter_config.json",
+        "adapter_model.safetensors",
     ]
     return any(f in files for f in model_indicators)
 

@@ -77,3 +77,13 @@ output:
 # 推論プレビュー設定 (非Teacher Forcingの動作確認用)
 inference:
   max_new_tokens: 100                  # 生成時の最大新規トークン数
+
+# LoRA / QLoRA 設定
+lora:
+  enabled: true                       # LoRA / QLoRA を有効にするか (falseの場合は従来の全パラメータ学習)
+  use_qlora: true                     # true: 4-bit量子化 (QLoRA), false: 通常のLoRA (16-bit)
+  r: 16                               # LoRAランク
+  lora_alpha: 32                      # LoRAスケーリング係数
+  lora_dropout: 0.05                  # ドロップアウト率
+  target_modules: ["c_attn", "c_proj"] # 対象モジュール (GPT-2系: c_attn, c_proj, c_fc 等)
+

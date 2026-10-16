@@ -11,14 +11,18 @@ SSH接続を切断（ログアウト）した後も学習を継続させるた�
 
 ### モデル保存の状態別 実行コマンド（nohup によるバックグラウンド実行）
 
-#### 0. 仮想環境の有効化
+#### 0. 仮想環境の有効化と必要なパッケージ
 必要なパッケージは次の通り。
-train時： `tqdm`, `numpy`, `pandas`, `matplotlib`, `pyyaml`, `torch`
-評価時： `tqdm`, `numpy`, `pandas`, `torch`, `nltk`, `bert-score`
+- 基本学習時: `tqdm`, `numpy`, `pandas`, `matplotlib`, `pyyaml`, `torch`
+- **QLoRA / LoRA 学習時 (追加必須)**: `peft`, `bitsandbytes`, `accelerate`
+- 評価時: `tqdm`, `numpy`, `pandas`, `torch`, `nltk`, `bert-score`, `peft`
 
+環境のアクティベートおよび QLoRA 向け追加パッケージのインストール:
 ```bash
 conda activate myenv
+pip install peft bitsandbytes accelerate
 ```
+
 
 ---
 

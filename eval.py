@@ -61,9 +61,30 @@ print(f"Using device: {device}")
 
 # トークナイザーと学習済みモデルのロード
 tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
-model = AutoModelForCausalLM.from_pretrained(model_dir)
-model.to(device)
+
+adapter_config_path = os.path.join(model_dir, "adapter_config.json")
+if os.path.exists(adapter_config_path):
+    print(f"LoRA/QLoRA adapter detected in {model_dir}. Loading base model and adapter...")
+    from peft import PeftModel
+    with open(adapter_config_path, "r", encoding="utf-8") as f:
+        adapter_cfg = json.load(f)
+    base_model_name = adapter_cfg.get("base_model_name_or_path") or config.get('model', {}).get('name', 'rinna/japanese-gpt-1b')
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    )
+    base_model.to(device)
+    model = PeftModel.from_pretrained(base_model, model_dir)
+    try:
+        model = model.merge_and_unload()
+    except Exception as e:
+        print(f"Note: merge_and_unload skipped ({e}), running directly with PeftModel.")
+else:
+    model = AutoModelForCausalLM.from_pretrained(model_dir)
+    model.to(device)
+
 model.eval()
+
 
 # テストデータの読み込み
 df_test = pd.read_csv(test_csv_path)

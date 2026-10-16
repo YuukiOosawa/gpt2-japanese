@@ -34,6 +34,13 @@ parser.add_argument("--eval_generation_mode", type=str, default=None, choices=["
                     help="検証時のトークン選択手法 (argmax/sample/gumbel)")
 parser.add_argument("--teacher_forcing_ratio", type=float, default=None,
                     help="Teacher Forcingの適用割合 (0.0で完全自律生成)")
+parser.add_argument("--use_qlora", type=str, default=None, choices=["true", "false", "True", "False"],
+                    help="QLoRA (4bit量子化 + LoRA) を使用するか (True/False)")
+parser.add_argument("--use_lora", type=str, default=None, choices=["true", "false", "True", "False"],
+                    help="LoRAを使用するか (True/False)")
+parser.add_argument("--lora_r", type=int, default=None, help="LoRAのランク (例: 8, 16)")
+parser.add_argument("--lora_alpha", type=int, default=None, help="LoRAのalpha (例: 16, 32)")
+parser.add_argument("--lora_dropout", type=float, default=None, help="LoRAのdropout率")
 args, unknown = parser.parse_known_args()
 
 # 設定ファイルの読み込み
@@ -64,6 +71,19 @@ if args.eval_generation_mode is not None:
     config.setdefault('training', {})['eval_generation_mode'] = args.eval_generation_mode
 if args.teacher_forcing_ratio is not None:
     config.setdefault('training', {})['teacher_forcing_ratio'] = args.teacher_forcing_ratio
+if args.use_qlora is not None:
+    config.setdefault('lora', {})['use_qlora'] = (args.use_qlora.lower() == "true")
+    if args.use_qlora.lower() == "true":
+        config.setdefault('lora', {})['enabled'] = True
+if args.use_lora is not None:
+    config.setdefault('lora', {})['enabled'] = (args.use_lora.lower() == "true")
+if args.lora_r is not None:
+    config.setdefault('lora', {})['r'] = args.lora_r
+if args.lora_alpha is not None:
+    config.setdefault('lora', {})['lora_alpha'] = args.lora_alpha
+if args.lora_dropout is not None:
+    config.setdefault('lora', {})['lora_dropout'] = args.lora_dropout
+
 
 # システム設定
 system_config = config.get('system', {})
@@ -192,10 +212,14 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 #df_train = pd.read_csv('amazon_review/amazon_review_train_valid.csv')
 #df_test = pd.read_csv('amazon_review/amazon_review_test.csv')
 
-# モデルとトークナイザーの読み込み
-tokenizer = AutoTokenizer.from_pretrained(modelname, use_fast=False)
-tokenizer.do_lower_case = do_lower_case
-model = AutoModelForCausalLM.from_pretrained(modelname)
+# LoRA / QLoRA 設定の読み込み
+lora_config = config.get('lora', {})
+lora_enabled = lora_config.get('enabled', False)
+use_qlora = lora_config.get('use_qlora', False) and lora_enabled
+lora_r = int(lora_config.get('r', 16))
+lora_alpha = int(lora_config.get('lora_alpha', 32))
+lora_dropout = float(lora_config.get('lora_dropout', 0.05))
+target_modules = lora_config.get('target_modules', ["c_attn", "c_proj"])
 
 device_setting = system_config.get('device', 'auto')
 if device_setting == 'auto':
@@ -213,20 +237,102 @@ else:
     device = torch.device(device_setting)
     print(f'device = {device_setting}')
 
-# AMP (GradScaler) を使用するため、モデルのマスターパラメータを float32 で保持
-# (rinna/japanese-gpt-1b 等、デフォルトで float16 のモデルの GradScaler エラーを防止)
-if model.dtype == torch.float16:
-    model = model.float()
+# モデルとトークナイザーの読み込み
+tokenizer = AutoTokenizer.from_pretrained(modelname, use_fast=False)
+tokenizer.do_lower_case = do_lower_case
 
-model.to(device)
-use_amp = device.type == 'cuda'
-if use_amp:
-    model.gradient_checkpointing_enable()
+if use_qlora:
+    try:
+        from transformers import BitsAndBytesConfig
+        from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model, TaskType
+    except ImportError as e:
+        raise ImportError(
+            "QLoRAの実行には peft, bitsandbytes, accelerate が必要です。\n"
+            "以下のコマンドでインストールしてください:\n"
+            "pip install peft bitsandbytes accelerate"
+        ) from e
+
+    print(f"=== QLoRA (4-bit NF4) を有効化します (r={lora_r}, alpha={lora_alpha}, targets={target_modules}) ===")
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16,
+    )
+    # QLoRAの場合、device_map でデバイスへ配置する (model.to(device) は不可)
+    cuda_idx = device.index if device.type == "cuda" and device.index is not None else (0 if device.type == "cuda" else "cpu")
+    device_map = {"": cuda_idx} if device.type == "cuda" else "auto"
+
+    model = AutoModelForCausalLM.from_pretrained(
+        modelname,
+        quantization_config=bnb_config,
+        device_map=device_map,
+        torch_dtype=torch.float16,
+    )
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+    )
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
     model.config.use_cache = False
+
+elif lora_enabled:
+    try:
+        from peft import LoraConfig, get_peft_model, TaskType
+    except ImportError as e:
+        raise ImportError(
+            "LoRAの実行には peft が必要です。\n"
+            "以下のコマンドでインストールしてください:\n"
+            "pip install peft"
+        ) from e
+
+    print(f"=== 通常LoRAを有効化します (r={lora_r}, alpha={lora_alpha}, targets={target_modules}) ===")
+    model = AutoModelForCausalLM.from_pretrained(modelname)
+    if model.dtype == torch.float16:
+        model = model.float()
+    model.to(device)
+
+    if device.type == 'cuda':
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+    )
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
+    model.config.use_cache = False
+
+else:
+    print("=== 全パラメータファインチューニング (Full Fine-tuning) を実行します ===")
+    model = AutoModelForCausalLM.from_pretrained(modelname)
+    if model.dtype == torch.float16:
+        model = model.float()
+    model.to(device)
+
+    if device.type == 'cuda':
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+
+use_amp = device.type == 'cuda'
 scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-# Optimizerの定義
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+# Optimizerの定義 (学習対象パラメータのみを登録)
+trainable_params = [p for p in model.parameters() if p.requires_grad]
+optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+
 
 # %%
 ADD_BOS_TOKEN = config['data']['add_bos_token']  # 文頭に<s>トークンを追加するかどうか
@@ -411,7 +517,7 @@ def autonomous_generate_stepwise(
                     step_logits, tau=max(temperature, 1e-5), hard=gumbel_hard
                 )
                 # soft token @ W_emb -> [batch_size, 1, hidden_size]
-                next_embed = torch.matmul(soft_dist.unsqueeze(1), embed_layer.weight)
+                next_embed = torch.matmul(soft_dist.to(embed_layer.weight.dtype).unsqueeze(1), embed_layer.weight).to(curr_inputs_embeds.dtype)
                 curr_inputs_embeds = torch.cat([curr_inputs_embeds, next_embed], dim=1)
                 curr_attention_mask = torch.cat(
                     [curr_attention_mask, torch.ones((batch_size, 1), device=device, dtype=curr_attention_mask.dtype)],
@@ -541,18 +647,18 @@ def decode_with_teacher_mask(
             if is_masked:
                 # maskedステップ: 正解トークンの埋め込みを入力
                 gt_token = labels[:, t].unsqueeze(1)
-                next_embed = embed_layer(gt_token)
+                next_embed = embed_layer(gt_token).to(curr_inputs_embeds.dtype)
             else:
                 # unmaskedステップ: モデル出力の埋め込みを入力
                 if generation_mode == "gumbel":
-                    next_embed = torch.matmul(step_prob.unsqueeze(1), embed_layer.weight)
+                    next_embed = torch.matmul(step_prob.to(embed_layer.weight.dtype).unsqueeze(1), embed_layer.weight).to(curr_inputs_embeds.dtype)
                 elif generation_mode == "sample":
                     probs = torch.softmax(step_logits / max(temperature, 1e-5), dim=-1)
                     next_token = torch.multinomial(probs, num_samples=1)
-                    next_embed = embed_layer(next_token)
+                    next_embed = embed_layer(next_token).to(curr_inputs_embeds.dtype)
                 else:  # argmax
                     next_token = step_logits.argmax(dim=-1, keepdim=True)
-                    next_embed = embed_layer(next_token)
+                    next_embed = embed_layer(next_token).to(curr_inputs_embeds.dtype)
 
             curr_inputs_embeds = torch.cat([curr_inputs_embeds, next_embed], dim=1)
             curr_attention_mask = torch.cat(
@@ -912,6 +1018,35 @@ for epoch in range(num_epochs):
             f.write(f"avg_train_loss={avg_train_loss:.4f}\n")
             f.write(f"avg_eval_loss={avg_eval_loss:.4f}\n")
             f.write(f"alpha={alpha}\n")
+            f.write(f"lora_enabled={lora_enabled}\n")
+            f.write(f"use_qlora={use_qlora}\n")
+            if lora_enabled:
+                f.write(f"lora_r={lora_r}\n")
+                f.write(f"lora_alpha={lora_alpha}\n")
+
+        # 設定で save_merged_model: true が指定されている場合、単体読み込み可能なマージ済みモデルも保存
+        if lora_enabled and lora_config.get('save_merged_model', False):
+            merged_d = f"{save_d}_merged"
+            print(f"マージモデル (独立実行可能) を保存中: {merged_d}")
+            try:
+                os.makedirs(merged_d, exist_ok=True)
+                from peft import PeftModel
+                merge_base = AutoModelForCausalLM.from_pretrained(
+                    modelname,
+                    torch_dtype=torch.float16,
+                    low_cpu_mem_usage=True
+                )
+                merge_model = PeftModel.from_pretrained(merge_base, save_d)
+                merged = merge_model.merge_and_unload()
+                merged.save_pretrained(merged_d)
+                tokenizer.save_pretrained(merged_d)
+                del merge_base, merge_model, merged
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"マージモデルの保存完了: {merged_d}")
+            except Exception as e:
+                print(f"マージモデルの保存中にエラーが発生しました (スキップします): {e}")
+
 
 
 
