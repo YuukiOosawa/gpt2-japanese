@@ -1,0 +1,77 @@
+# ==========================================
+# GPT-2 日本語モデル 途中再開設定 (config_resume.yml)
+# ==========================================
+
+# システム設定
+system:
+  device: "auto"
+  seed: 2025
+
+# モデル設定
+model:
+  name: "rinna/japanese-gpt-1b"
+  do_lower_case: true
+
+# データセット設定
+data:
+  train_path: "amazon_review/amazon_review_train2.csv"
+  valid_path: "amazon_review/amazon_review_valid2.csv"
+  test_path: "amazon_review/amazon_review_test.csv"
+  src_column: "j_lists"
+  src_test_column: "j_lists_test"
+  tgt_column: "sentence"
+  add_bos_token: true
+  shortcut: true
+  shortcut_sizes:
+    train: 15000
+    valid: 3700
+    test: 560
+  train_subset_size: 1500
+  train_subset_seed: 2025
+  valid_subset_size: 500
+  valid_subset_seed: 2025
+
+# 学習ハイパーパラメータ（OOM対策を反映）
+training:
+  epochs: 25
+  start_epoch: 11                     # 10エポック目から再開
+  batch_size: 1                       # ★16から 8 に下げてOOMを回避
+  eval_batch_size: 4
+  accumulation_steps: 16               # ★バッチサイズを下げた分、必要に応じて累積を増やす（実効バッチサイズ維持）
+  learning_rate: 0.00005
+  weight_decay: 0.01
+  teacher_forcing_ratio: 0.0
+  generation_mode: "gumbel"
+  eval_generation_mode: "argmax"
+  
+  # ★再開元チェックポイントのディレクトリ指定
+  resume_checkpoint_dir: "models_2_1009/finetuned_model_epoch_11"
+
+  mask_schedule:
+    0: "0:1"
+    10: "2:2"
+    15: "4:2"
+    20: "1:0"
+
+# DEBLEU 損失設定
+bleu:
+  enabled: true
+  max_ngram: 4
+  weights: [0.1, 0.3, 0.3, 0.3]
+  target_only: true
+  alpha_schedule:
+    0: 0.0
+    10: 0.001
+    15: 0.005
+    20: 0.01
+
+# 出力・モデル保存先設定
+output:
+  save_dir: "models_2_1009"
+  save_prefix: "finetuned_model_epoch"
+  save_intermediate_checkpoints: true
+  save_epoch_interval: 1
+
+# 推論プレビュー設定
+inference:
+  max_new_tokens: 100

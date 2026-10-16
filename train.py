@@ -2,14 +2,18 @@
 # 必要なパッケージの読み込み、使用モデル等の指定
 
 # %%
+import os
+# CUDAアロケータの断片化防止
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from tqdm import tqdm
 import time
-import os
 import yaml
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import torch
+import random
 import argparse
 
 # コマンドライン引数の設定
@@ -22,7 +26,14 @@ parser.add_argument("--epochs", type=int, default=None, help="学習エポック
 parser.add_argument("--save_dir", type=str, default=None, help="保存先親ディレクトリ")
 parser.add_argument("--alpha", type=float, default=None, help="DEBLEU損失の重みalpha (固定値指定用)")
 parser.add_argument("--learning_rate", type=float, default=None, help="学習率")
-parser.add_argument("--batch_size", type=int, default=None, help="バッチサイズ")
+parser.add_argument("--batch_size", type=int, default=None, help="バッチサイズ (学習時)")
+parser.add_argument("--eval_batch_size", type=int, default=None, help="検証・テスト時のバッチサイズ (例: 2, 4, 8)")
+parser.add_argument("--generation_mode", type=str, default=None, choices=["argmax", "sample", "gumbel"],
+                    help="自律生成時のトークン選択手法 (argmax/sample/gumbel)")
+parser.add_argument("--eval_generation_mode", type=str, default=None, choices=["argmax", "sample", "gumbel"],
+                    help="検証時のトークン選択手法 (argmax/sample/gumbel)")
+parser.add_argument("--teacher_forcing_ratio", type=float, default=None,
+                    help="Teacher Forcingの適用割合 (0.0で完全自律生成)")
 args, unknown = parser.parse_known_args()
 
 # 設定ファイルの読み込み
@@ -43,8 +54,16 @@ if args.learning_rate is not None:
     config.setdefault('training', {})['learning_rate'] = args.learning_rate
 if args.batch_size is not None:
     config.setdefault('training', {})['batch_size'] = args.batch_size
+if args.eval_batch_size is not None:
+    config.setdefault('training', {})['eval_batch_size'] = args.eval_batch_size
 if args.alpha is not None:
     config.setdefault('bleu', {})['alpha_schedule'] = {0: args.alpha}
+if args.generation_mode is not None:
+    config.setdefault('training', {})['generation_mode'] = args.generation_mode
+if args.eval_generation_mode is not None:
+    config.setdefault('training', {})['eval_generation_mode'] = args.eval_generation_mode
+if args.teacher_forcing_ratio is not None:
+    config.setdefault('training', {})['teacher_forcing_ratio'] = args.teacher_forcing_ratio
 
 # システム設定
 system_config = config.get('system', {})
@@ -63,6 +82,8 @@ do_lower_case = config['model'].get('do_lower_case', True)
 data_config = config.get('data', {})
 num_epochs = config['training']['epochs']
 shortcut = data_config.get('shortcut', False)
+valid_subset_size = data_config.get('valid_subset_size', False)
+valid_subset_seed = data_config.get('valid_subset_seed', 2025)
 ADD_BOS_TOKEN = data_config.get('add_bos_token', True)
 src_col = data_config.get('src_column', 'j_lists')
 src_test_col = data_config.get('src_test_column', 'j_lists_test')
@@ -71,10 +92,41 @@ tgt_col = data_config.get('tgt_column', 'sentence')
 # 学習設定
 training_config = config.get('training', {})
 batch_size = training_config['batch_size']
+eval_batch_size = int(training_config.get('eval_batch_size', training_config.get('valid_batch_size', 4)))
 accumulation_steps = training_config.get('accumulation_steps', 1)
 learning_rate = float(training_config['learning_rate'])
 weight_decay = float(training_config.get('weight_decay', 0.01))
-teacher_forcing_ratio = float(training_config.get('teacher_forcing_ratio', 0.5))
+teacher_forcing_ratio = float(training_config.get('teacher_forcing_ratio', 0.0))
+generation_mode = training_config.get('generation_mode', 'argmax')
+eval_generation_mode = training_config.get('eval_generation_mode', 'argmax')
+mask_schedule = training_config.get('mask_schedule') or bleu_config.get('mask_schedule')
+
+def parse_mask_pattern(pattern_str: str) -> tuple:
+    """
+    Teacher mask パターン文字列 (例: '2:2', '0:1', '1:0') をパース
+    戻り値: (unmasked_steps, masked_steps)
+    """
+    if not pattern_str or ":" not in str(pattern_str):
+        return (1, 0)
+    parts = str(pattern_str).strip().split(":")
+    return int(parts[0]), int(parts[1])
+
+def get_mask_pattern(epoch_idx: int):
+    """configのmask_scheduleから指定エポックのteacher maskパターンを取得"""
+    if mask_schedule is None:
+        return None
+    if isinstance(mask_schedule, dict):
+        matched = [int(k) for k in mask_schedule.keys() if int(k) <= epoch_idx]
+        if matched:
+            best_k = max(matched)
+            val = mask_schedule.get(best_k, mask_schedule.get(str(best_k), "1:0"))
+            return str(val)
+        return "1:0"
+    elif isinstance(mask_schedule, list):
+        if epoch_idx < len(mask_schedule):
+            return str(mask_schedule[epoch_idx])
+        return str(mask_schedule[-1])
+    return str(mask_schedule)
 
 # DEBLEU設定
 bleu_config = config.get('bleu', {})
@@ -130,6 +182,10 @@ if shortcut:
     print(len(df_train),len(df_test),len(df_valid))
 df_train
 
+if valid_subset_size and isinstance(valid_subset_size, int) and len(df_valid) > valid_subset_size:
+    df_valid = df_valid.sample(n=valid_subset_size, random_state=valid_subset_seed).reset_index(drop=True)
+    print(f"Validation dataset downsampled to {len(df_valid)} samples (seed={valid_subset_seed}).")
+
 # %%
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -156,6 +212,11 @@ if device_setting == 'auto':
 else:
     device = torch.device(device_setting)
     print(f'device = {device_setting}')
+
+# AMP (GradScaler) を使用するため、モデルのマスターパラメータを float32 で保持
+# (rinna/japanese-gpt-1b 等、デフォルトで float16 のモデルの GradScaler エラーを防止)
+if model.dtype == torch.float16:
+    model = model.float()
 
 model.to(device)
 use_amp = device.type == 'cuda'
@@ -224,85 +285,284 @@ for i in range(len(train_dataset[0][0]['input_ids'])):
 
 # %%
 batch_size = config['training']['batch_size']
+eval_batch_size = int(config['training'].get('eval_batch_size', config['training'].get('valid_batch_size', 4)))
 accumulation_steps = config['training']['accumulation_steps']  # 有効バッチサイズは維持
 
-print('For Teacher Forcing Training')
-def collate_fnTF(batch):
+print('For Autonomous Generation (Non-teacher Forcing) & Teacher Forcing')
+
+def collate_fnNTF(batch):
+    """
+    自律生成 (Non-teacher Forcing) 用の collate 関数:
+    - src_batch: 入力部（[BOS] + 自立語系列 + [SEP]）を left-padding
+    - tgt_batch: 完成文（正解トークン列）を right-padding
+    """
     data_list = {'input_ids': [], 'attention_mask': []}
     label_list = {'input_ids': [], 'attention_mask': []}
-    # ミニバッチの中のデータ(d)とラベル(l)を一つずつ取り出してリストに追加
     for d, l in batch:
-        data_list['input_ids'].append(torch.tensor(d['input_ids'], dtype=torch.int))
-        data_list['attention_mask'].append(torch.tensor(d['attention_mask'], dtype=torch.int))
-        label_list['input_ids'].append(torch.tensor(l['input_ids'], dtype=torch.long))
-        label_list['attention_mask'].append(torch.tensor(l['attention_mask'], dtype=torch.long))
-    # [pad]を詰めて長さを揃える
-    src_batch = {'input_ids': torch.nn.utils.rnn.pad_sequence(data_list['input_ids'], batch_first=True, padding_value=tokenizer.pad_token_id, padding_side='right'), 
-                 'attention_mask': torch.nn.utils.rnn.pad_sequence(data_list['attention_mask'], batch_first=True, padding_value=0)}
-    tgt_batch = {'input_ids': torch.nn.utils.rnn.pad_sequence(label_list['input_ids'], batch_first=True, padding_value=tokenizer.pad_token_id, padding_side='right'), 
-                 'attention_mask': torch.nn.utils.rnn.pad_sequence(label_list['attention_mask'], batch_first=True, padding_value=0)}
+        # 入力部: [SEP] トークンまでを取得 (元データを破壊しないよう安全にスライス)
+        src_sep_idx = d['input_ids'].index(tokenizer.sep_token_id) + 1
+        src_ids = d['input_ids'][:src_sep_idx]
+        src_mask = d['attention_mask'][:src_sep_idx]
+        data_list['input_ids'].append(torch.tensor(src_ids, dtype=torch.long))
+        data_list['attention_mask'].append(torch.tensor(src_mask, dtype=torch.long))
+
+        # 完成文 (正解ターゲット): [SEP] の直後から末尾までを取得
+        tgt_sep_idx = l['input_ids'].index(tokenizer.sep_token_id) + 1
+        tgt_ids = l['input_ids'][tgt_sep_idx:]
+        tgt_mask = l['attention_mask'][tgt_sep_idx:]
+        label_list['input_ids'].append(torch.tensor(tgt_ids, dtype=torch.long))
+        label_list['attention_mask'].append(torch.tensor(tgt_mask, dtype=torch.long))
+
+    # CausalLMでの生成用に、入力部は left-padding、ターゲットは right-padding
+    src_batch = {
+        'input_ids': torch.nn.utils.rnn.pad_sequence(data_list['input_ids'], batch_first=True, padding_value=tokenizer.pad_token_id, padding_side='left'), 
+        'attention_mask': torch.nn.utils.rnn.pad_sequence(data_list['attention_mask'], batch_first=True, padding_value=0, padding_side='left')
+    }
+    tgt_batch = {
+        'input_ids': torch.nn.utils.rnn.pad_sequence(label_list['input_ids'], batch_first=True, padding_value=tokenizer.pad_token_id, padding_side='right'), 
+        'attention_mask': torch.nn.utils.rnn.pad_sequence(label_list['attention_mask'], batch_first=True, padding_value=0, padding_side='right')
+    }
     return src_batch, tgt_batch
 
-train_dataloaderTF = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_fnTF, shuffle=True)
-print('Train:', len(train_dataset), 'samples /', len(train_dataloaderTF), 'batches')
-valid_dataloaderTF = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, collate_fn=collate_fnTF, shuffle=False)
-print('Valid:', len(valid_dataset), 'samples /', len(valid_dataloaderTF), 'batches')
-test_dataloaderTF = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fnTF, shuffle=False)
-print('Test: ', len(test_dataset), 'samples /', len(test_dataloaderTF), 'batches')
-
-# %%
-print('For Non-teacher Forcing Training')
-def collate_fnNTF(batch):
+def collate_fnTF(batch):
+    """従来の Teacher Forcing 用 collate 関数 (互換性用)"""
     data_list = {'input_ids': [], 'attention_mask': []}
     label_list = {'input_ids': [], 'attention_mask': []}
-    # ミニバッチの中のデータ(d)とラベル(l)を一つずつ取り出してリストに追加
     for d, l in batch:
-        print(d['input_ids'], tokenizer.convert_ids_to_tokens(d['input_ids']))
-        i = d['input_ids'].index(tokenizer.sep_token_id) + 1
-        d['input_ids'] = d['input_ids'][:i]
-        d['attention_mask'] = d['attention_mask'][:i]
-        data_list['input_ids'].append(torch.tensor(d['input_ids'], dtype=torch.int))
-        data_list['attention_mask'].append(torch.tensor(d['attention_mask'], dtype=torch.int))
-        print(l['input_ids'], tokenizer.convert_ids_to_tokens(l['input_ids']))
-        i = l['input_ids'].index(tokenizer.sep_token_id) + 1
-        l['input_ids'] = l['input_ids'][i:]
-        l['attention_mask'] = l['attention_mask'][i:]
+        data_list['input_ids'].append(torch.tensor(d['input_ids'], dtype=torch.long))
+        data_list['attention_mask'].append(torch.tensor(d['attention_mask'], dtype=torch.long))
         label_list['input_ids'].append(torch.tensor(l['input_ids'], dtype=torch.long))
         label_list['attention_mask'].append(torch.tensor(l['attention_mask'], dtype=torch.long))
-    # [pad]を詰めて長さを揃える
-    src_batch = {'input_ids': torch.nn.utils.rnn.pad_sequence(data_list['input_ids'], batch_first=True, padding_value=tokenizer.pad_token_id, padding_side='left'), 
-                 'attention_mask': torch.nn.utils.rnn.pad_sequence(data_list['attention_mask'], batch_first=True, padding_value=0)}
-    tgt_batch = {'input_ids': torch.nn.utils.rnn.pad_sequence(label_list['input_ids'], batch_first=True, padding_value=tokenizer.pad_token_id, padding_side='right'), 
-                 'attention_mask': torch.nn.utils.rnn.pad_sequence(label_list['attention_mask'], batch_first=True, padding_value=0)}
+    src_batch = {
+        'input_ids': torch.nn.utils.rnn.pad_sequence(data_list['input_ids'], batch_first=True, padding_value=tokenizer.pad_token_id, padding_side='right'), 
+        'attention_mask': torch.nn.utils.rnn.pad_sequence(data_list['attention_mask'], batch_first=True, padding_value=0)
+    }
+    tgt_batch = {
+        'input_ids': torch.nn.utils.rnn.pad_sequence(label_list['input_ids'], batch_first=True, padding_value=tokenizer.pad_token_id, padding_side='right'), 
+        'attention_mask': torch.nn.utils.rnn.pad_sequence(label_list['attention_mask'], batch_first=True, padding_value=0)
+    }
     return src_batch, tgt_batch
 
 train_dataloaderNTF = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_fnNTF, shuffle=True)
-print('Train:', len(train_dataset), 'samples /', len(train_dataloaderTF), 'batches')
-valid_dataloaderNTF = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, collate_fn=collate_fnNTF, shuffle=False)
-print('Valid:', len(valid_dataset), 'samples /', len(valid_dataloaderTF), 'batches')
-test_dataloaderNTF = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fnNTF, shuffle=False)
-print('Test: ', len(test_dataset), 'samples /', len(test_dataloaderTF), 'batches')
+valid_dataloaderNTF = torch.utils.data.DataLoader(valid_dataset, batch_size=eval_batch_size, collate_fn=collate_fnNTF, shuffle=False)
+test_dataloaderNTF = torch.utils.data.DataLoader(test_dataset, batch_size=eval_batch_size, collate_fn=collate_fnNTF, shuffle=False)
 
-# %%
-# Inference mode (非teacher forcing)で使う model.generate() の使用例
-# Inference mode は未実装
+train_dataloaderTF = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_fnTF, shuffle=True)
+valid_dataloaderTF = torch.utils.data.DataLoader(valid_dataset, batch_size=eval_batch_size, collate_fn=collate_fnTF, shuffle=False)
+test_dataloaderTF = torch.utils.data.DataLoader(test_dataset, batch_size=eval_batch_size, collate_fn=collate_fnTF, shuffle=False)
 
-for batch in train_dataloaderNTF:
-    print(batch[0]['input_ids'].shape[1], batch[1]['input_ids'].shape[1])
-    outputs = model.generate(batch[0]['input_ids'].to(device), attention_mask=batch[0]['attention_mask'].to(device), 
-                             pad_token_id=tokenizer.pad_token_id, 
-                             max_new_tokens=max_new_tokens, 
-                             return_dict_in_generate=True, 
-                             output_scores=True)
-    break
+# 自律生成用のメインDataLoader
+train_dataloader = train_dataloaderNTF
+valid_dataloader = valid_dataloaderNTF
+test_dataloader = test_dataloaderNTF
 
-for i in range(len(outputs.sequences)):
-    for j in range(len(outputs.scores)):
-        print(tokenizer.decode(outputs.scores[j][i].argmax().item(), skip_special_tokens=False), end=' ')
-    print('')
+print('Train (NTF):', len(train_dataset), 'samples /', len(train_dataloader), 'batches')
+print('Valid (NTF):', len(valid_dataset), 'samples /', len(valid_dataloader), 'batches')
+print('Test  (NTF):', len(test_dataset), 'samples /', len(test_dataloader), 'batches')
 
-# %%
-teacher_forcing_ratio = config['training']['teacher_forcing_ratio']
+def autonomous_generate_stepwise(
+    model,
+    src_input_ids: torch.Tensor,
+    src_attention_mask: torch.Tensor,
+    max_steps: int,
+    generation_mode: str = "argmax",
+    temperature: float = 1.0,
+    gumbel_hard: bool = True,
+) -> torch.Tensor:
+    """
+    自己回帰（自律）逐次文生成関数:
+    - 最初の1ステップ目は入力部のみを参考に出力トークンを生成
+    - 以降のステップでは入力部 ＋ 直前までのモデル自身の生成結果を参考にしてトークン出力を行う
+    - generation_mode='gumbel' の場合:
+      Gumbel-Softmax による soft token 分布と Embedding 行列の積により inputs_embeds を生成・連結し、
+      自己回帰系列全体にわたる勾配逆伝播 (BPTT) を可能にする (論文 DEBLEU Section 3.3, Fig. 2)。
+    - generation_mode='argmax' / 'sample' の場合:
+      離散トークンID列 (input_ids) を用いて省メモリかつ高速に逐次生成を行う。
+
+    Args:
+        model: CausalLMモデル
+        src_input_ids: 入力部（プロンプト）のトークンID列 [batch_size, prompt_len] (left padding)
+        src_attention_mask: 入力部のアテンションマスク [batch_size, prompt_len] (left padding)
+        max_steps: 生成するステップ数（正解文長 T*）
+        generation_mode: トークン選択手法 ('argmax', 'sample', 'gumbel')
+        temperature: サンプリング・Gumbel-Softmax時の温度パラメータ
+        gumbel_hard: generation_mode='gumbel' のとき Straight-Through (hard=True) を適用するか否か
+
+    Returns:
+        generated_logits: 各ステップで出力されたロジットテンソル [batch_size, max_steps, vocab_size]
+    """
+    batch_size = src_input_ids.size(0)
+    device = src_input_ids.device
+    curr_attention_mask = src_attention_mask
+    logits_list = []
+
+    if generation_mode == "gumbel":
+        embed_layer = model.get_input_embeddings()
+        curr_inputs_embeds = embed_layer(src_input_ids)
+
+        for t in range(max_steps):
+            outputs = model(inputs_embeds=curr_inputs_embeds, attention_mask=curr_attention_mask)
+            step_logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+            logits_list.append(step_logits)
+
+            if t < max_steps - 1:
+                # Gumbel-Softmax による soft token 分布を取得 [batch_size, vocab_size]
+                soft_dist = torch.nn.functional.gumbel_softmax(
+                    step_logits, tau=max(temperature, 1e-5), hard=gumbel_hard
+                )
+                # soft token @ W_emb -> [batch_size, 1, hidden_size]
+                next_embed = torch.matmul(soft_dist.unsqueeze(1), embed_layer.weight)
+                curr_inputs_embeds = torch.cat([curr_inputs_embeds, next_embed], dim=1)
+                curr_attention_mask = torch.cat(
+                    [curr_attention_mask, torch.ones((batch_size, 1), device=device, dtype=curr_attention_mask.dtype)],
+                    dim=1
+                )
+    else:
+        curr_input_ids = src_input_ids
+
+        for t in range(max_steps):
+            outputs = model(input_ids=curr_input_ids, attention_mask=curr_attention_mask)
+            step_logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+            logits_list.append(step_logits)
+
+            if t < max_steps - 1:
+                if generation_mode == "sample":
+                    probs = torch.softmax(step_logits / max(temperature, 1e-5), dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:  # argmax
+                    next_token = step_logits.argmax(dim=-1, keepdim=True)
+
+                curr_input_ids = torch.cat([curr_input_ids, next_token], dim=1)
+                curr_attention_mask = torch.cat(
+                    [curr_attention_mask, torch.ones((batch_size, 1), device=device, dtype=curr_attention_mask.dtype)],
+                    dim=1
+                )
+
+    return torch.stack(logits_list, dim=1)
+
+
+def decode_with_teacher_mask(
+    model,
+    src_input_ids: torch.Tensor,
+    src_attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    max_steps: int,
+    mask_pattern: str = "1:0",
+    generation_mode: str = "gumbel",
+    temperature: float = 1.0,
+    gumbel_hard: bool = True,
+    random_shift: bool = True,
+    pad_token_id: int = tokenizer.pad_token_id,
+) -> tuple:
+    """
+    Teacher Mask付きデコーディング関数 (論文 DEBLEU Section 3.3, Fig. 2):
+    - mask_pattern ("#unmasked:#masked") に従って、maskedステップとunmaskedステップを交互に適用
+    - maskedステップ:
+      次ステップ入力として正解トークン (ground truth) を与え、
+      DEBLEU評価用の確率分布としても正解トークンのone-hot表現を使用する。
+    - unmaskedステップ:
+      次ステップ入力としてモデル自身の出力 (Gumbel-Softmaxソフトトークン等) を与え、
+      DEBLEU評価用の確率分布としてもモデル予測分布を使用する。
+    - ランダムシフト: 各イテレーションでマスク開始位置をランダムにシフトして正則化・汎化性を向上。
+    - 特殊ケース "0:1" (全ステップmasked):
+      すべてのステップが正解トークン参照 (Teacher Forcing) となるため、並列forwardにより高速に計算。
+
+    Args:
+        model: CausalLMモデル
+        src_input_ids: 入力部（プロンプト）のトークンID列 [batch_size, prompt_len] (left padding)
+        src_attention_mask: 入力部のアテンションマスク [batch_size, prompt_len] (left padding)
+        labels: 正解文のトークンID列 [batch_size, max_steps]
+        max_steps: 生成ステップ数（正解文長 T*）
+        mask_pattern: "unmasked:masked" 形式の文字列 (例: "0:1", "2:2", "4:2", "1:0")
+        generation_mode: トークン選択手法 ('argmax', 'sample', 'gumbel')
+        temperature: Gumbel-Softmax / サンプリング時の温度
+        gumbel_hard: Gumbel-Softmax時にStraight-Through (hard=True) を適用するか否か
+        random_shift: イテレーションごとのマスク位置ランダムシフトを行うか否か
+        pad_token_id: パディングトークンID
+
+    Returns:
+        generated_logits: モデル出力の生ロジット [batch_size, max_steps, vocab_size] (CE損失計算用)
+        debleu_probs: DEBLEU計算用確率テンソル [batch_size, max_steps, vocab_size] (maskedステップはone-hot)
+    """
+    batch_size = src_input_ids.size(0)
+    device = src_input_ids.device
+    embed_layer = model.get_input_embeddings()
+    vocab_size = embed_layer.weight.size(0)
+
+    u, m = parse_mask_pattern(mask_pattern)
+
+    # 1. 完全なTeacher Forcing ("0:1" 等、unmasked_steps == 0) の場合は一括並列forwardで高速化
+    if u == 0:
+        prompt_len = src_input_ids.size(1)
+        if max_steps > 1:
+            tf_inputs = torch.cat([src_input_ids, labels[:, :max_steps - 1]], dim=1)
+            tf_mask = torch.cat([
+                src_attention_mask,
+                (labels[:, :max_steps - 1] != pad_token_id).to(src_attention_mask.dtype)
+            ], dim=1)
+        else:
+            tf_inputs = src_input_ids
+            tf_mask = src_attention_mask
+
+        outputs = model(input_ids=tf_inputs, attention_mask=tf_mask)
+        generated_logits = outputs.logits[:, prompt_len - 1 : prompt_len - 1 + max_steps, :]
+        debleu_probs = torch.nn.functional.one_hot(labels[:, :max_steps], num_classes=vocab_size).to(generated_logits.dtype)
+        return generated_logits, debleu_probs
+
+    # 2. Teacher Mask ("2:2", "4:2", "1:0" 等) の逐次デコーディング
+    C = u + m
+    offset = random.randint(0, C - 1) if (random_shift and C > 0) else 0
+
+    curr_inputs_embeds = embed_layer(src_input_ids)
+    curr_attention_mask = src_attention_mask
+    logits_list = []
+    probs_list = []
+
+    for t in range(max_steps):
+        is_masked = (m > 0 and ((t + offset) % C) >= u)
+
+        outputs = model(inputs_embeds=curr_inputs_embeds, attention_mask=curr_attention_mask)
+        step_logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+        logits_list.append(step_logits)
+
+        # DEBLEU評価用の確率分布 (maskedステップは正解one-hot、unmaskedステップは予測確率)
+        if is_masked:
+            gt_token = labels[:, t]
+            step_prob = torch.nn.functional.one_hot(gt_token, num_classes=vocab_size).to(step_logits.dtype)
+        else:
+            if generation_mode == "gumbel":
+                step_prob = torch.nn.functional.gumbel_softmax(step_logits, tau=max(temperature, 1e-5), hard=gumbel_hard)
+            else:
+                step_prob = torch.softmax(step_logits, dim=-1)
+        probs_list.append(step_prob)
+
+        # 最終ステップでなければ次ステップの入力埋め込みを作成して連結
+        if t < max_steps - 1:
+            if is_masked:
+                # maskedステップ: 正解トークンの埋め込みを入力
+                gt_token = labels[:, t].unsqueeze(1)
+                next_embed = embed_layer(gt_token)
+            else:
+                # unmaskedステップ: モデル出力の埋め込みを入力
+                if generation_mode == "gumbel":
+                    next_embed = torch.matmul(step_prob.unsqueeze(1), embed_layer.weight)
+                elif generation_mode == "sample":
+                    probs = torch.softmax(step_logits / max(temperature, 1e-5), dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    next_embed = embed_layer(next_token)
+                else:  # argmax
+                    next_token = step_logits.argmax(dim=-1, keepdim=True)
+                    next_embed = embed_layer(next_token)
+
+            curr_inputs_embeds = torch.cat([curr_inputs_embeds, next_embed], dim=1)
+            curr_attention_mask = torch.cat(
+                [curr_attention_mask, torch.ones((batch_size, 1), device=device, dtype=curr_attention_mask.dtype)],
+                dim=1
+            )
+
+    generated_logits = torch.stack(logits_list, dim=1)
+    debleu_probs = torch.stack(probs_list, dim=1)
+    return generated_logits, debleu_probs
 
 
 # CE損失
@@ -402,7 +662,7 @@ def criterionBLEU(
             bp = 1.0
 
         # M^1: M^1_{i, j} = p(y_i = y^*_j) = P_{i, y^*_j} (Appendix A, 式18)
-        M = p[:, ref]  # [T, T_star]
+        M = p.index_select(dim=1, index=ref)  # [T, T_star]
 
         # 参照文同士の一致行列 R^1: R^1_{j1, j2} = 1[y^*_{j1} == y^*_{j2}]
         R = (ref.unsqueeze(0) == ref.unsqueeze(1)).to(dtype)
@@ -492,25 +752,62 @@ for epoch in range(num_epochs):
 
     # configのalpha_scheduleからalphaを取得
     alpha = get_alpha(epoch)
-    print(f"[Epoch {epoch}] alpha = {alpha}")
+    # configのmask_scheduleからteacher maskパターンを取得
+    cur_mask_pattern = get_mask_pattern(epoch)
+    print(f"[Epoch {epoch}] alpha = {alpha}, mask_pattern = {cur_mask_pattern if cur_mask_pattern is not None else '(teacher_forcing_ratio)'}")
 
-    for step, batch in enumerate(tqdm(train_dataloaderTF, desc="Train")):
-        use_teacher_forcing = True if np.random.rand() < teacher_forcing_ratio else False
-        inputs = batch[0]['input_ids'].to(device)
-        attention_mask = batch[0]['attention_mask'].to(device)
+    for step, batch in enumerate(tqdm(train_dataloader, desc="Train")):
+        src_inputs = batch[0]['input_ids'].to(device)
+        src_attention_mask = batch[0]['attention_mask'].to(device)
         labels = batch[1]['input_ids'].to(device)
+        target_len = labels.shape[1]
         
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-            outputs = model(input_ids=inputs, attention_mask=attention_mask)
-            ce_loss = criterionCE(torch.transpose(outputs.logits, 1, 2), labels)
+            if cur_mask_pattern is not None:
+                # 論文 DEBLEU Section 3.3: Teacher Mask によるデコーディング
+                generated_logits, debleu_probs = decode_with_teacher_mask(
+                    model=model,
+                    src_input_ids=src_inputs,
+                    src_attention_mask=src_attention_mask,
+                    labels=labels,
+                    max_steps=target_len,
+                    mask_pattern=cur_mask_pattern,
+                    generation_mode=generation_mode,
+                )
+            else:
+                # 従来の teacher_forcing_ratio によるフォールバック
+                use_teacher_forcing = (np.random.rand() < teacher_forcing_ratio) if teacher_forcing_ratio > 0.0 else False
+                if use_teacher_forcing:
+                    # Teacher Forcing: 入力部 + 直前の正解参照文トークン
+                    prompt_len = src_inputs.shape[1]
+                    if target_len > 1:
+                        tf_inputs = torch.cat([src_inputs, labels[:, :-1]], dim=1)
+                        tf_attention_mask = torch.cat([src_attention_mask, (labels[:, :-1] != tokenizer.pad_token_id).to(src_attention_mask.dtype)], dim=1)
+                    else:
+                        tf_inputs = src_inputs
+                        tf_attention_mask = src_attention_mask
+                    outputs = model(input_ids=tf_inputs, attention_mask=tf_attention_mask)
+                    generated_logits = outputs.logits[:, prompt_len - 1 : prompt_len - 1 + target_len, :]
+                else:
+                    # 自律逐次生成
+                    generated_logits = autonomous_generate_stepwise(
+                        model=model,
+                        src_input_ids=src_inputs,
+                        src_attention_mask=src_attention_mask,
+                        max_steps=target_len,
+                        generation_mode=generation_mode,
+                    )
+                debleu_probs = generated_logits
+
+            ce_loss = criterionCE(torch.transpose(generated_logits, 1, 2), labels)
             
             if alpha > 0.0:
                 bleu_loss, bleu_score = criterionBLEU(
-                    outputs.logits,
+                    debleu_probs,
                     labels,
                     pad_token_id=tokenizer.pad_token_id,
                     sep_token_id=tokenizer.sep_token_id,
-                    target_only=bleu_target_only,
+                    target_only=False,  # labelsは完成文のみ
                     N=bleu_max_ngram,
                     weights=bleu_weights,
                     return_loss=True,
@@ -524,17 +821,22 @@ for epoch in range(num_epochs):
                 loss = ce_loss
 
         scaler.scale(loss / accumulation_steps).backward()
-        if (step + 1) % accumulation_steps == 0 or step + 1 == len(train_dataloaderTF):
+        if (step + 1) % accumulation_steps == 0 or step + 1 == len(train_dataloader):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
         total_loss += loss.item()
         total_ce_loss += ce_loss.item()
 
-    avg_train_loss = total_loss / len(train_dataloaderTF)
-    avg_ce_loss = total_ce_loss / len(train_dataloaderTF)
+    avg_train_loss = total_loss / len(train_dataloader)
+    avg_ce_loss = total_ce_loss / len(train_dataloader)
     avg_bleu_loss = (total_bleu_loss / bleu_count) if bleu_count > 0 else 0.0
     avg_bleu_score = (total_bleu_score / bleu_count) if bleu_count > 0 else 0.0
+
+    # 学習ループ終了後、オプティマイザの勾配をクリアしGPUキャッシュを解放して検証時のOOMを防止
+    optimizer.zero_grad(set_to_none=True)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # 検証ループ
     model.eval()
@@ -543,21 +845,30 @@ for epoch in range(num_epochs):
     eval_bleu_loss = 0
     eval_bleu_score = 0
     eval_bleu_count = 0
-    with torch.no_grad():
-        for batch in tqdm(valid_dataloaderTF, desc="Valid"):
-            inputs = batch[0]['input_ids'].to(device)
-            attention_mask = batch[0]['attention_mask'].to(device)
+    # 勾配計算の完全無効化・バージョン追跡無効化による省メモリ・高速化
+    with torch.inference_mode():
+        for batch in tqdm(valid_dataloader, desc="Valid"):
+            src_inputs = batch[0]['input_ids'].to(device)
+            src_attention_mask = batch[0]['attention_mask'].to(device)
             labels = batch[1]['input_ids'].to(device)
+            target_len = labels.shape[1]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                outputs = model(input_ids=inputs, attention_mask=attention_mask)
-                ce_loss = criterionCE(torch.transpose(outputs.logits, 1, 2), labels)
+                # 検証時も自律生成で次トークンを出力・評価
+                generated_logits = autonomous_generate_stepwise(
+                    model=model,
+                    src_input_ids=src_inputs,
+                    src_attention_mask=src_attention_mask,
+                    max_steps=target_len,
+                    generation_mode=eval_generation_mode,
+                )
+                ce_loss = criterionCE(torch.transpose(generated_logits, 1, 2), labels)
                 if alpha > 0.0:
                     bleu_loss, bleu_score = criterionBLEU(
-                        outputs.logits,
+                        generated_logits,
                         labels,
                         pad_token_id=tokenizer.pad_token_id,
                         sep_token_id=tokenizer.sep_token_id,
-                        target_only=bleu_target_only,
+                        target_only=False,
                         N=bleu_max_ngram,
                         weights=bleu_weights,
                         return_loss=True,
@@ -571,8 +882,11 @@ for epoch in range(num_epochs):
                     loss = ce_loss
             eval_loss += loss.item()
             eval_ce_loss += ce_loss.item()
-    avg_eval_loss = eval_loss / len(valid_dataloaderTF)
-    avg_eval_ce_loss = eval_ce_loss / len(valid_dataloaderTF)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    avg_eval_loss = eval_loss / len(valid_dataloader)
+    avg_eval_ce_loss = eval_ce_loss / len(valid_dataloader)
     avg_eval_bleu_score = (eval_bleu_score / eval_bleu_count) if eval_bleu_count > 0 else 0.0
 
     if alpha > 0.0:

@@ -9,7 +9,7 @@ system:
 
 # モデル設定
 model:
-  name: "rinna/japanese-gpt2-medium"  # 使用するモデル名 (候補: 'rinna/japanese-gpt-1b')
+  name: "rinna/japanese-gpt-1b"  # 使用するモデル名 (候補: 1b or medium)
   do_lower_case: true                 # トークナイザーの小文字化設定
 
 # データセット設定
@@ -21,20 +21,36 @@ data:
   src_test_column: "j_lists_test"     # 入力文のカラム名 (test)
   tgt_column: "sentence"              # 正解文のカラム名
   add_bos_token: true                 # 文頭に<s>トークンを追加するかどうか
-  shortcut: false                     # データを一部に絞って実行するかどうか
+  shortcut: true                     # データを一部に絞って実行するかどうか
   shortcut_sizes:
     train: 15000                      # shortcut有効時の学習データ数
     valid: 3700                       # shortcut有効時の検証データ数
     test: 560                         # shortcut有効時のテストデータ数
 
+# 追加: 検証データのサブサイズ（整数を指定するとその件数にランダムサンプリング。false または null で全量使用）
+  valid_subset_size: 500
+  valid_subset_seed: 2025             # サンプリング時の再現性を確保するためのシード
+
 # 学習ハイパーパラメータ
 training:
-  epochs: 20                          # エポック数 (例: 3, 5, 23)
-  batch_size: 16                      # バッチサイズ
+  epochs: 25                          # エポック数 (例: 20, 25)
+  batch_size: 16                      # 学習時バッチサイズ
+  eval_batch_size: 4                  # 検証・テスト時バッチサイズ (OOM防止のため小さく設定: 2, 4, 8等)
   accumulation_steps: 1               # 勾配累積ステップ数 (有効バッチサイズ = batch_size * accumulation_steps)
   learning_rate: 0.00005              # 学習率 (5e-5)
   weight_decay: 0.01                  # Weight Decay
-  teacher_forcing_ratio: 0.5          # Teacher Forcingの適用割合
+  teacher_forcing_ratio: 0.0          # Teacher Forcingの適用割合 (mask_schedule未設定時のフォールバック)
+  generation_mode: "gumbel"           # 自律生成時のトークン選択手法 ('argmax', 'sample', 'gumbel')
+  eval_generation_mode: "argmax"      # 検証時のトークン選択手法 ('argmax', 'sample', 'gumbel') - argmax推奨
+  # Teacher Mask スケジュール (論文 DEBLEU Section 3.3)
+  # 書式: エポック数: "unmasked_steps:masked_steps"
+  # 0:1 は全ステップで正解トークンを参照するTeacher Forcingと同じ意味です
+  # 1:0 は全ステップでモデル自身の生成結果を参照する完全自律生成です
+  mask_schedule:
+    0: "0:1"
+    10: "2:2"
+    15: "4:2"
+    20: "1:0"
 
 # DEBLEU (Differentiable Expected BLEU) 損失設定
 bleu:
@@ -48,15 +64,16 @@ bleu:
   alpha_schedule:
     0: 0.0
     10: 0.001
-    15: 0.002
+    15: 0.005
+    20: 0.01
 
 # 出力・モデル保存先設定
 output:
-  save_dir: "models"                  # モデル保存先親ディレクトリ
+  save_dir: "models_2_1009"                  # モデル保存先親ディレクトリ
   save_prefix: "finetuned_model_epoch" # 保存ディレクトリの接頭辞 (例: finetuned_model_epoch_1)
   save_intermediate_checkpoints: true # 指定したエポック毎にモデルを保存するか (True: 指定間隔 + 最終エポック, False: 最終エポックのみ)
   save_epoch_interval: 1              # モデルを保存するエポックの間隔 (例: 5なら5, 10, ...エポック毎)
 
 # 推論プレビュー設定 (非Teacher Forcingの動作確認用)
 inference:
-  max_new_tokens: 50                  # 生成時の最大新規トークン数
+  max_new_tokens: 100                  # 生成時の最大新規トークン数

@@ -29,6 +29,7 @@ def is_model_directory(path):
 
 
 def main():
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
     parser = argparse.ArgumentParser(
         description="指定フォルダ内の全モデルに対して eval.py を順次実行し、結果を指定フォルダに格納するスクリプト"
     )

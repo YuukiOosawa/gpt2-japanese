@@ -5,7 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # --- 設定 ---
-base_dir = "models"
+base_dir = "models_2_1009"
 prefix = "finetuned_model_epoch_"
 use_alpha = False
 

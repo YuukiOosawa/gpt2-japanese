@@ -12,7 +12,7 @@ SSH接続を切断（ログアウト）した後も学習を継続させるた�
 ### モデル保存の状態別 実行コマンド（nohup によるバックグラウンド実行）
 
 #### 0. 仮想環境の有効化
-必要なパッケージは次の通りです。
+必要なパッケージは次の通り。
 train時： `tqdm`, `numpy`, `pandas`, `matplotlib`, `pyyaml`, `torch`
 評価時： `tqdm`, `numpy`, `pandas`, `torch`, `nltk`, `bert-score`
 
@@ -71,6 +71,13 @@ nohup python -u train.py > output.log 2>&1 &
 別ファイルを指定して実行する場合:
 ```bash
 nohup python -u train.py --config config_custom.yml > output.log 2>&1 &
+```
+
+#### 4. 途中から実行する場合
+途中再開用のコードとconfigを使用して実行
+
+```bash
+nohup python resume_train.py > train_resume.log 2>&1 &
 ```
 
 ---
@@ -152,3 +159,8 @@ for model_dir in $(ls -d models/*/ | sort -V); do
     python eval.py --model_dir "${model_dir}" --output_dir eval_results
 done
 ```
+
+## その他pyファイルの説明
+
+`check_result.py` : eval_results内のBLEU, BERTScoreを確認するコード。ファイル内でdirを指定。
+`draw_learning_curve.py` : 学習曲線を描くコード。ファイル内でdirを指定。
